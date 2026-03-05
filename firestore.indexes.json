@@ -1,0 +1,13 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "user_checklist",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "checklistId", "order": "ASCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "248305733427",
+    "project_id": "college-and-career-checklist",
+    "storage_bucket": "college-and-career-checklist.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:248305733427:android:2b1ca3c1a23b53d7db7846",
+        "android_client_info": {
+          "package_name": "com.checklist.collegecareer"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAFxxfvyZ7vy6ila3VgXP8DEIs0zELOLRA"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
