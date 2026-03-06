@@ -1,6 +1,6 @@
 name: college_and_career_checklist
 description: A shared checklist app with per-user completion using Firebase.
-version: 1.0.0+2
+version: 1.0.0+3
 publish_to: "none"
 
 environment:
