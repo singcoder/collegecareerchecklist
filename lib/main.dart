@@ -44,7 +44,12 @@ class _FirebaseInitErrorApp extends StatelessWidget {
                 if (stackTrace.isNotEmpty) ...[
                   const SizedBox(height: 16),
                   const Text('Details:', style: TextStyle(fontWeight: FontWeight.bold)),
-                  Expanded(child: SingleChildScrollView(child: Text(stackTrace, style: const TextStyle(fontSize: 10)))],
+                  Expanded(
+                    child: SingleChildScrollView(
+                      child: Text(stackTrace, style: const TextStyle(fontSize: 10)),
+                    ),
+                  ),
+                ],
               ],
             ),
           ),
