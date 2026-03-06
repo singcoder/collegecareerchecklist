@@ -10,10 +10,48 @@ import 'package:url_launcher/url_launcher.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp(
-      // options: DefaultFirebaseOptions.currentPlatform,
-      );
+  try {
+    await Firebase.initializeApp(
+        // options: DefaultFirebaseOptions.currentPlatform,
+        );
+  } catch (e, st) {
+    runApp(_FirebaseInitErrorApp(message: e.toString(), stackTrace: st.toString()));
+    return;
+  }
   runApp(const MyApp());
+}
+
+/// Shown when Firebase fails to initialize (e.g. missing GoogleService-Info.plist in bundle).
+class _FirebaseInitErrorApp extends StatelessWidget {
+  const _FirebaseInitErrorApp({required this.message, required this.stackTrace});
+
+  final String message;
+  final String stackTrace;
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      home: Scaffold(
+        body: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text('Firebase could not start', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 16),
+                Text(message, style: const TextStyle(color: Colors.red)),
+                if (stackTrace.isNotEmpty) ...[
+                  const SizedBox(height: 16),
+                  const Text('Details:', style: TextStyle(fontWeight: FontWeight.bold)),
+                  Expanded(child: SingleChildScrollView(child: Text(stackTrace, style: const TextStyle(fontSize: 10)))],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class MyApp extends StatelessWidget {
