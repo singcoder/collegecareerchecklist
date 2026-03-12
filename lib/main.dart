@@ -1,62 +1,19 @@
-import 'package:flutter/material.dart';
-import 'package:firebase_core/firebase_core.dart';
-import 'package:firebase_auth/firebase_auth.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:url_launcher/url_launcher.dart';
+import 'dart:async';
 
-// TODO: After running `flutterfire configure`, uncomment this import
-// and pass DefaultFirebaseOptions into Firebase.initializeApp.
-// import 'firebase_options.dart';
+import 'package:flutter/material.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'supabase_config.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  try {
-    await Firebase.initializeApp(
-        // options: DefaultFirebaseOptions.currentPlatform,
-        );
-  } catch (e, st) {
-    runApp(_FirebaseInitErrorApp(message: e.toString(), stackTrace: st.toString()));
-    return;
-  }
+  await Supabase.initialize(
+    url: supabaseUrl,
+    anonKey: supabaseAnonKey,
+  );
   runApp(const MyApp());
-}
-
-/// Shown when Firebase fails to initialize (e.g. missing GoogleService-Info.plist in bundle).
-class _FirebaseInitErrorApp extends StatelessWidget {
-  const _FirebaseInitErrorApp({required this.message, required this.stackTrace});
-
-  final String message;
-  final String stackTrace;
-
-  @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      home: Scaffold(
-        body: SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                const Text('Firebase could not start', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-                const SizedBox(height: 16),
-                Text(message, style: const TextStyle(color: Colors.red)),
-                if (stackTrace.isNotEmpty) ...[
-                  const SizedBox(height: 16),
-                  const Text('Details:', style: TextStyle(fontWeight: FontWeight.bold)),
-                  Expanded(
-                    child: SingleChildScrollView(
-                      child: Text(stackTrace, style: const TextStyle(fontSize: 10)),
-                    ),
-                  ),
-                ],
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
 }
 
 class MyApp extends StatelessWidget {
@@ -81,92 +38,176 @@ class AuthGate extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return StreamBuilder<User?>(
-      stream: FirebaseAuth.instance.authStateChanges(),
+    return StreamBuilder<AuthState>(
+      stream: Supabase.instance.client.auth.onAuthStateChange,
       builder: (context, snapshot) {
         if (snapshot.connectionState == ConnectionState.waiting) {
           return const Scaffold(
             body: Center(child: CircularProgressIndicator()),
           );
         }
-
-        final user = snapshot.data;
-        if (user == null) {
-          return const EmailPasswordSignInScreen();
+        final session = snapshot.data?.session;
+        if (session == null) {
+          return const EmailCodeSignInScreen();
         }
-
         return const ChecklistScreen();
       },
     );
   }
 }
 
-/// Simple email/password sign-in + sign-up combined.
-class EmailPasswordSignInScreen extends StatefulWidget {
-  const EmailPasswordSignInScreen({super.key});
+/// Email-only sign-in: enter email → we send a code → they enter code → signed in.
+class EmailCodeSignInScreen extends StatefulWidget {
+  const EmailCodeSignInScreen({super.key});
 
   @override
-  State<EmailPasswordSignInScreen> createState() =>
-      _EmailPasswordSignInScreenState();
+  State<EmailCodeSignInScreen> createState() => _EmailCodeSignInScreenState();
 }
 
-class _EmailPasswordSignInScreenState
-    extends State<EmailPasswordSignInScreen> {
+const String _savedLoginEmailKey = 'saved_login_email';
+
+class _EmailCodeSignInScreenState extends State<EmailCodeSignInScreen> {
   final _emailController = TextEditingController();
-  final _passwordController = TextEditingController();
+  final _codeController = TextEditingController();
   bool _isLoading = false;
   String? _error;
+  String? _pendingEmail;
+  bool _codeSent = false;
+  DateTime? _resendAvailableAfter;
+  Timer? _resendCooldownTimer;
+  static const int _resendCooldownSeconds = 90;
 
-  Future<void> _signInOrRegister() async {
+  @override
+  void initState() {
+    super.initState();
+    _loadSavedEmail();
+  }
+
+  @override
+  void dispose() {
+    _resendCooldownTimer?.cancel();
+    _emailController.dispose();
+    _codeController.dispose();
+    super.dispose();
+  }
+
+  void _clearVerificationState() {
+    _resendCooldownTimer?.cancel();
+    _resendCooldownTimer = null;
+    setState(() {
+      _pendingEmail = null;
+      _codeSent = false;
+      _resendAvailableAfter = null;
+      _codeController.clear();
+      _error = null;
+    });
+  }
+
+  Future<void> _loadSavedEmail() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString(_savedLoginEmailKey);
+    if (saved != null && saved.isNotEmpty && mounted) {
+      setState(() => _emailController.text = saved);
+    }
+  }
+
+  Future<void> _saveEmail(String email) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_savedLoginEmailKey, email);
+  }
+
+  static final RegExp _emailRegex = RegExp(
+    r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$',
+  );
+
+  Future<void> _sendVerificationCode() async {
+    final email = (_pendingEmail ?? _emailController.text.trim()).trim().toLowerCase();
+    if (email.isEmpty) {
+      setState(() => _error = 'Enter your email');
+      return;
+    }
+    if (!_emailRegex.hasMatch(email)) {
+      setState(() => _error = 'Enter a valid email address');
+      return;
+    }
     setState(() {
       _isLoading = true;
       _error = null;
     });
-
     try {
-      final email = _emailController.text.trim();
-      final password = _passwordController.text.trim();
-
-      try {
-        // Try sign-in first.
-        await FirebaseAuth.instance.signInWithEmailAndPassword(
-          email: email,
-          password: password,
-        );
-      } on FirebaseAuthException catch (e) {
-        // If user does not exist, create them. Firebase often returns
-        // invalid-credential instead of user-not-found for new users.
-        final isMaybeNewUser = e.code == 'user-not-found' ||
-            e.code == 'invalid-credential' ||
-            e.code == 'invalid-login-credentials';
-        if (isMaybeNewUser) {
-          try {
-            await FirebaseAuth.instance.createUserWithEmailAndPassword(
-              email: email,
-              password: password,
-            );
-          } on FirebaseAuthException catch (createE) {
-            // Email already in use = user exists, wrong password.
-            if (createE.code == 'email-already-in-use') {
-              throw e; // Show original "invalid credential" message.
-            }
-            throw createE; // e.g. weak-password
+      await Supabase.instance.client.auth.signInWithOtp(email: email);
+      if (mounted) {
+        _resendCooldownTimer?.cancel();
+        _resendAvailableAfter = DateTime.now().add(const Duration(seconds: _resendCooldownSeconds));
+        _resendCooldownTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+          if (!mounted) return;
+          if (DateTime.now().isAfter(_resendAvailableAfter!)) {
+            _resendCooldownTimer?.cancel();
+            _resendCooldownTimer = null;
+            setState(() => _resendAvailableAfter = null);
+            return;
           }
-        } else {
-          rethrow;
-        }
+          setState(() {});
+        });
+        setState(() {
+          _pendingEmail = email;
+          _codeSent = true;
+          _isLoading = false;
+        });
       }
-    } on FirebaseAuthException catch (e) {
-      setState(() {
-        _error = e.message;
-      });
-    } catch (e) {
-      setState(() {
-        _error = 'Unexpected error: $e';
-      });
-    } finally {
+    } on AuthException catch (e) {
+      if (mounted) {
+        final msg = e.message ?? 'Failed to send code';
+        final isRateLimit = msg.toLowerCase().contains('limit') ||
+            msg.toLowerCase().contains('rate') ||
+            msg.toLowerCase().contains('too many');
+        setState(() {
+          _error = isRateLimit
+              ? 'Email limit reached. Supabase limits how often codes can be sent. Please try again in 30–60 minutes.'
+              : msg;
+          _isLoading = false;
+        });
+      }
+    } catch (e, st) {
       if (mounted) {
         setState(() {
+          _error = 'Failed to send code: ${e.toString()}';
+          _isLoading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _verifyCodeAndSignIn() async {
+    final email = _pendingEmail;
+    final code = _codeController.text.trim();
+    if (email == null || code.isEmpty) {
+      setState(() => _error = 'Enter the verification code');
+      return;
+    }
+    setState(() {
+      _isLoading = true;
+      _error = null;
+    });
+    try {
+      await Supabase.instance.client.auth.verifyOTP(
+        type: OtpType.email,
+        email: email,
+        token: code,
+      );
+      await _saveEmail(email);
+      _clearVerificationState();
+    } on AuthException catch (e) {
+      if (mounted) {
+        setState(() {
+          _error = e.message;
+          _isLoading = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _error = 'Invalid or expired code. Request a new one.';
           _isLoading = false;
         });
       }
@@ -175,41 +216,101 @@ class _EmailPasswordSignInScreenState
 
   @override
   Widget build(BuildContext context) {
+    final showCodeStep = _codeSent;
+
     return Scaffold(
-      appBar: AppBar(title: const Text('Sign in')),
+      appBar: AppBar(
+        title: Text(showCodeStep ? 'Verify email' : 'Sign in'),
+        leading: showCodeStep
+            ? IconButton(
+                icon: const Icon(Icons.arrow_back),
+                onPressed: _isLoading ? null : _clearVerificationState,
+              )
+            : null,
+      ),
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            TextField(
-              controller: _emailController,
-              decoration: const InputDecoration(labelText: 'Email'),
-              keyboardType: TextInputType.emailAddress,
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _passwordController,
-              decoration: const InputDecoration(labelText: 'Password'),
-              obscureText: true,
-            ),
-            const SizedBox(height: 24),
-            if (_error != null)
-              Text(
-                _error!,
-                style: const TextStyle(color: Colors.red),
+            if (!showCodeStep) ...[
+              TextField(
+                controller: _emailController,
+                decoration: const InputDecoration(labelText: 'Email'),
+                keyboardType: TextInputType.emailAddress,
               ),
-            const SizedBox(height: 8),
-            ElevatedButton(
-              onPressed: _isLoading ? null : _signInOrRegister,
-              child: _isLoading
-                  ? const SizedBox(
-                      width: 16,
-                      height: 16,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Text('Sign in / Register'),
-            ),
+              const SizedBox(height: 24),
+              if (_error != null)
+                Text(
+                  _error!,
+                  style: const TextStyle(color: Colors.red),
+                ),
+              const SizedBox(height: 8),
+              ElevatedButton(
+                onPressed: _isLoading ? null : _sendVerificationCode,
+                child: _isLoading
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Text('Send verification code'),
+              ),
+            ] else ...[
+              Text(
+                'Enter the verification code we sent to $_pendingEmail',
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Emails can take 1–2 minutes. Check spam. Resend is available after the countdown.',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+              const SizedBox(height: 24),
+              TextField(
+                controller: _codeController,
+                decoration: const InputDecoration(
+                  labelText: 'Verification code',
+                  hintText: '00000000',
+                ),
+                keyboardType: TextInputType.number,
+                maxLength: 8,
+                autofocus: true,
+              ),
+              const SizedBox(height: 12),
+              if (_error != null)
+                Text(
+                  _error!,
+                  style: const TextStyle(color: Colors.red),
+                ),
+              const SizedBox(height: 8),
+              ElevatedButton(
+                onPressed: _isLoading ? null : _verifyCodeAndSignIn,
+                child: _isLoading
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Text('Verify and sign in'),
+              ),
+              const SizedBox(height: 16),
+              Text(
+                "Didn't get the email? Check spam or resend the code.",
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+              const SizedBox(height: 4),
+              TextButton(
+                onPressed: _isLoading || (_resendAvailableAfter != null && DateTime.now().isBefore(_resendAvailableAfter!))
+                    ? null
+                    : _sendVerificationCode,
+                child: Text(
+                  _resendAvailableAfter != null && DateTime.now().isBefore(_resendAvailableAfter!)
+                      ? 'Resend code (in ${_resendAvailableAfter!.difference(DateTime.now()).inSeconds}s)'
+                      : 'Resend code',
+                ),
+              ),
+            ],
           ],
         ),
       ),
@@ -217,30 +318,188 @@ class _EmailPasswordSignInScreenState
   }
 }
 
-/// Tracks which users we've already initialized (one record per item) so we don't overwrite.
+/// Tracks which users we've already initialized so we don't overwrite.
 final Set<String> _initializedUserChecklists = {};
 
 /// Shows the shared checklist with per-user completion and optional URLs.
-class ChecklistScreen extends StatelessWidget {
+class ChecklistScreen extends StatefulWidget {
   const ChecklistScreen({super.key});
 
   @override
+  State<ChecklistScreen> createState() => _ChecklistScreenState();
+}
+
+class _ChecklistScreenState extends State<ChecklistScreen> {
+  List<Map<String, dynamic>> _items = [];
+  Map<String, bool> _completionMap = {};
+  bool _loading = true;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    final client = Supabase.instance.client;
+    final user = client.auth.currentUser;
+    if (user == null) return;
+
+    try {
+      final itemsRes = await client
+          .from('checklist_items')
+          .select()
+          .eq('checklist_id', 'global')
+          .order('sort_order');
+
+      final items = List<Map<String, dynamic>>.from(itemsRes as List);
+      items.sort((a, b) {
+        final aOrder = (a['sort_order'] as num?)?.toInt() ?? 0;
+        final bOrder = (b['sort_order'] as num?)?.toInt() ?? 0;
+        return aOrder.compareTo(bOrder);
+      });
+
+      final ucRes = await client
+          .from('user_checklist')
+          .select('item_id, is_complete')
+          .eq('user_id', user.id)
+          .eq('checklist_id', 'global');
+
+      final completionMap = <String, bool>{};
+      for (final row in ucRes as List) {
+        final map = row as Map<String, dynamic>;
+        final itemId = map['item_id'] as String?;
+        if (itemId != null) {
+          completionMap[itemId] = map['is_complete'] == true;
+        }
+      }
+
+      if (items.isNotEmpty && completionMap.isEmpty && !_initializedUserChecklists.contains(user.id)) {
+        _initializedUserChecklists.add(user.id);
+        await _createUserChecklistRecords(
+          userId: user.id,
+          checklistId: 'global',
+          itemIds: items.map<String>((e) => e['id'] as String).toList(),
+        );
+        for (final item in items) {
+          completionMap[item['id'] as String] = false;
+        }
+      }
+
+      if (mounted) {
+        setState(() {
+          _items = items;
+          _completionMap = completionMap;
+          _loading = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _error = e.toString();
+          _loading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _createUserChecklistRecords({
+    required String userId,
+    required String checklistId,
+    required List<String> itemIds,
+  }) async {
+    final client = Supabase.instance.client;
+    for (final itemId in itemIds) {
+      final docId = '${userId}_${checklistId}_$itemId';
+      await client.from('user_checklist').insert({
+        'id': docId,
+        'user_id': userId,
+        'checklist_id': checklistId,
+        'item_id': itemId,
+        'is_complete': false,
+        'completed_at': null,
+      });
+    }
+  }
+
+  Future<void> _updateCompletion({
+    required String userId,
+    required String checklistId,
+    required String itemId,
+    required bool isComplete,
+  }) async {
+    final docId = '${userId}_${checklistId}_$itemId';
+    await Supabase.instance.client.from('user_checklist').upsert({
+      'id': docId,
+      'user_id': userId,
+      'checklist_id': checklistId,
+      'item_id': itemId,
+      'is_complete': isComplete,
+      'completed_at': isComplete ? DateTime.now().toIso8601String() : null,
+      'created_at': DateTime.now().toIso8601String(),
+    });
+    setState(() {
+      _completionMap[itemId] = isComplete;
+    });
+  }
+
+  static Future<void> _openUrl(String url) async {
+    final trimmed = url.trim();
+    if (trimmed.isEmpty) return;
+    final urlWithScheme = trimmed.contains(RegExp(r'^https?://', caseSensitive: false))
+        ? trimmed
+        : 'https://$trimmed';
+    final uri = Uri.tryParse(urlWithScheme);
+    if (uri == null || !uri.hasScheme) return;
+    try {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (_) {}
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final user = FirebaseAuth.instance.currentUser!;
-    final uid = user.uid;
+    final user = Supabase.instance.client.auth.currentUser!;
+    final uid = user.id;
 
-    final itemsQuery = FirebaseFirestore.instance
-        .collection('checklists')
-        .doc('global')
-        .collection('items')
-        .snapshots();
-
-    // Associative table: (user, checklist, checklist_item) -> completion
-    const checklistId = 'global';
-    final userChecklistQuery = FirebaseFirestore.instance
-        .collection('user_checklist')
-        .where('userId', isEqualTo: uid)
-        .where('checklistId', isEqualTo: checklistId);
+    if (_loading) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+    if (_error != null) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('My Checklist')),
+        body: Center(child: Text('Error: $_error')),
+      );
+    }
+    if (_items.isEmpty) {
+      return Scaffold(
+        appBar: AppBar(
+          title: const Text('My Checklist'),
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.logout),
+              onPressed: () => Supabase.instance.client.auth.signOut(),
+              tooltip: 'Sign out',
+            ),
+          ],
+        ),
+        body: const Center(
+          child: Padding(
+            padding: EdgeInsets.all(24),
+            child: Text(
+              'No checklist items. Add rows to checklist_items in Supabase.',
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ),
+      );
+    }
 
     return Scaffold(
       appBar: AppBar(
@@ -248,210 +507,51 @@ class ChecklistScreen extends StatelessWidget {
         actions: [
           IconButton(
             icon: const Icon(Icons.logout),
-            onPressed: () => FirebaseAuth.instance.signOut(),
+            onPressed: () => Supabase.instance.client.auth.signOut(),
             tooltip: 'Sign out',
           ),
         ],
       ),
-      body: StreamBuilder<QuerySnapshot>(
-        stream: itemsQuery,
-        builder: (context, itemsSnapshot) {
-          if (itemsSnapshot.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator());
-          }
-          if (itemsSnapshot.hasError) {
-            return Center(child: Text('Error: ${itemsSnapshot.error}'));
-          }
+      body: ListView.builder(
+        itemCount: _items.length,
+        itemBuilder: (context, index) {
+          final item = _items[index];
+          final id = item['id'] as String;
+          final title = item['title'] as String? ?? '';
+          final url = item['url'] as String? ?? '';
+          final isComplete = _completionMap[id] ?? false;
 
-          final itemsDocs = itemsSnapshot.data?.docs ?? [];
-          if (itemsDocs.isEmpty) {
-            final projectId = Firebase.app().options.projectId ?? '?';
-            return Center(
-              child: Padding(
-                padding: const EdgeInsets.all(24.0),
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    const Text('No checklist items.'),
-                    const SizedBox(height: 16),
-                    Text(
-                      'App project: $projectId',
-                      style: Theme.of(context).textTheme.bodySmall,
-                      textAlign: TextAlign.center,
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      'Path: checklists → global → items',
-                      style: Theme.of(context).textTheme.bodySmall,
-                      textAlign: TextAlign.center,
-                    ),
-                  ],
-                ),
-              ),
-            );
-          }
-          // Sort by order (no index required). Handle both num and string from Firestore.
-          num orderValue(dynamic v) {
-            if (v == null) return 0;
-            if (v is num) return v;
-            if (v is String) return num.tryParse(v) ?? 0;
-            return 0;
-          }
-          itemsDocs.sort((a, b) {
-            final orderA = orderValue((a.data() as Map<String, dynamic>)['order']);
-            final orderB = orderValue((b.data() as Map<String, dynamic>)['order']);
-            return orderA.compareTo(orderB);
-          });
-
-          return StreamBuilder<QuerySnapshot>(
-            stream: userChecklistQuery.snapshots(),
-            builder: (context, userChecklistSnapshot) {
-              if (userChecklistSnapshot.connectionState ==
-                  ConnectionState.waiting) {
-                return const Center(child: CircularProgressIndicator());
-              }
-              if (userChecklistSnapshot.hasError) {
-                return Center(
-                    child: Text('Error: ${userChecklistSnapshot.error}'));
-              }
-
-              final completionMap = <String, bool>{};
-              for (final doc in userChecklistSnapshot.data?.docs ?? []) {
-                final data = doc.data() as Map<String, dynamic>;
-                final itemId = data['itemId'] as String?;
-                if (itemId != null) {
-                  completionMap[itemId] = data['isComplete'] == true;
-                }
-              }
-
-              // First time this user sees the checklist: create one user_checklist doc per item (unchecked).
-              final userDocs = userChecklistSnapshot.data?.docs ?? [];
-              if (userDocs.isEmpty &&
-                  itemsDocs.isNotEmpty &&
-                  !_initializedUserChecklists.contains(uid)) {
-                _initializedUserChecklists.add(uid);
-                _createUserChecklistRecords(
-                  uid: uid,
-                  checklistId: checklistId,
-                  itemIds: itemsDocs.map((d) => d.id).toList(),
-                );
-              }
-
-              return ListView.builder(
-                itemCount: itemsDocs.length,
-                itemBuilder: (context, index) {
-                  final doc = itemsDocs[index];
-                  final data = doc.data() as Map<String, dynamic>;
-                  final title = data['title'] as String? ?? '';
-                  final url = data['url'] as String? ?? '';
-                  final isComplete = completionMap[doc.id] ?? false;
-
-                  return Card(
-                    margin:
-                        const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                    child: ListTile(
-                      leading: Checkbox(
-                        value: isComplete,
-                        onChanged: (value) {
-                          if (value == null) return;
-                          _updateCompletion(
-                            uid: uid,
-                            checklistId: checklistId,
-                            itemId: doc.id,
-                            isComplete: value,
-                          );
-                        },
-                      ),
-                      title: url.isNotEmpty
-                          ? InkWell(
-                              onTap: () => _openUrl(url),
-                              child: Text(
-                                title,
-                                style: const TextStyle(
-                                  decoration: TextDecoration.underline,
-                                  decorationColor: Colors.blue,
-                                ),
-                              ),
-                            )
-                          : Text(title),
-                      subtitle: null,
-                    ),
+          return Card(
+            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            child: ListTile(
+              leading: Checkbox(
+                value: isComplete,
+                onChanged: (value) {
+                  if (value == null) return;
+                  _updateCompletion(
+                    userId: uid,
+                    checklistId: 'global',
+                    itemId: id,
+                    isComplete: value,
                   );
                 },
-              );
-            },
+              ),
+              title: url.isNotEmpty
+                  ? InkWell(
+                      onTap: () => _openUrl(url),
+                      child: Text(
+                        title,
+                        style: const TextStyle(
+                          decoration: TextDecoration.underline,
+                          decorationColor: Colors.blue,
+                        ),
+                      ),
+                    )
+                  : Text(title),
+            ),
           );
         },
       ),
     );
   }
-
-  /// Creates one user_checklist doc per item (isComplete: false) for a new user.
-  static Future<void> _createUserChecklistRecords({
-    required String uid,
-    required String checklistId,
-    required List<String> itemIds,
-  }) async {
-    final firestore = FirebaseFirestore.instance;
-    final batch = firestore.batch();
-    for (final itemId in itemIds) {
-      final docId = '${uid}_${checklistId}_$itemId';
-      final docRef = firestore.collection('user_checklist').doc(docId);
-      batch.set(docRef, {
-        'userId': uid,
-        'checklistId': checklistId,
-        'itemId': itemId,
-        'isComplete': false,
-        'completedAt': null,
-        'createdAt': FieldValue.serverTimestamp(),
-      });
-    }
-    await batch.commit();
-  }
-
-  static Future<void> _updateCompletion({
-    required String uid,
-    required String checklistId,
-    required String itemId,
-    required bool isComplete,
-  }) async {
-    // Associative doc: one row per (user, checklist, checklist_item)
-    final docId = '${uid}_${checklistId}_$itemId';
-    final docRef = FirebaseFirestore.instance
-        .collection('user_checklist')
-        .doc(docId);
-
-    await docRef.set(
-      {
-        'userId': uid,
-        'checklistId': checklistId,
-        'itemId': itemId,
-        'isComplete': isComplete,
-        'completedAt':
-            isComplete ? FieldValue.serverTimestamp() : null,
-        'createdAt': FieldValue.serverTimestamp(),
-      },
-      SetOptions(merge: true),
-    );
-  }
-
-  static Future<void> _openUrl(String url) async {
-    final trimmed = url.trim();
-    if (trimmed.isEmpty) return;
-    // Android requires a scheme (https/http) to open in browser.
-    final urlWithScheme = trimmed.contains(RegExp(r'^https?://', caseSensitive: false))
-        ? trimmed
-        : 'https://$trimmed';
-    final uri = Uri.tryParse(urlWithScheme);
-    if (uri == null || !uri.hasScheme) return;
-    try {
-      await launchUrl(
-        uri,
-        mode: LaunchMode.externalApplication,
-      );
-    } catch (_) {
-      // Emulator may have no browser; ignore so app doesn't crash.
-    }
-  }
 }
-

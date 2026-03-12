@@ -1,5 +1,5 @@
 name: college_and_career_checklist
-description: A shared checklist app with per-user completion using Firebase.
+description: A shared checklist app with per-user completion using Supabase.
 version: 1.0.0+3
 publish_to: "none"
 
@@ -10,13 +10,14 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # Firebase
-  firebase_core: ^3.0.0
-  firebase_auth: ^5.0.0
-  cloud_firestore: ^5.0.0
+  # Supabase (auth + database)
+  supabase_flutter: ^2.0.0
 
   # Open URLs in the phone browser
   url_launcher: ^6.3.0
+
+  # Persist saved login email
+  shared_preferences: ^2.2.2
 
   # Standard Flutter icons
   cupertino_icons: ^1.0.8
